@@ -3,36 +3,115 @@ import fs from "fs/promises";
 
 const TARGET_URL = "https://www.whatnot.com/user/collectingfever/reviews";
 const OUTPUT_FILE = "whatnot-reviews.json";
-
-// তোমার requirement
 const LIMIT = 6;
 
-// helper
 const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
 
-async function clickIfExists(page, role, nameRegex) {
-  try {
-    const el = page.getByRole(role, { name: nameRegex });
-    if ((await el.count()) > 0) {
-      await el.first().click({ timeout: 1500 });
-      return true;
+function isObject(x) {
+  return x && typeof x === "object" && !Array.isArray(x);
+}
+
+// Recursively search JSON for arrays of "review-like" objects
+function findReviewItemsDeep(node, found = []) {
+  if (!node) return found;
+
+  if (Array.isArray(node)) {
+    // If this array looks like reviews, collect
+    // Heuristics: objects with rating + text/message/comment + username/buyer
+    const maybe = [];
+    for (const item of node) {
+      if (!isObject(item)) continue;
+
+      const keys = Object.keys(item).map((k) => k.toLowerCase());
+
+      const hasRating =
+        keys.includes("rating") ||
+        keys.includes("stars") ||
+        keys.includes("score") ||
+        keys.some((k) => k.includes("rating"));
+
+      const hasText =
+        keys.includes("text") ||
+        keys.includes("message") ||
+        keys.includes("comment") ||
+        keys.includes("review") ||
+        keys.some((k) => k.includes("comment") || k.includes("message") || k.includes("text"));
+
+      const hasUser =
+        keys.includes("username") ||
+        keys.includes("reviewer") ||
+        keys.includes("buyer") ||
+        keys.includes("user") ||
+        keys.some((k) => k.includes("user") || k.includes("buyer"));
+
+      if (hasRating && hasText && hasUser) {
+        maybe.push(item);
+      }
     }
-  } catch {}
-  return false;
+
+    if (maybe.length >= 1) {
+      found.push(...maybe);
+    }
+
+    // Continue traversal
+    for (const item of node) findReviewItemsDeep(item, found);
+    return found;
+  }
+
+  if (isObject(node)) {
+    for (const v of Object.values(node)) findReviewItemsDeep(v, found);
+  }
+
+  return found;
+}
+
+function normalizeReview(item) {
+  // Try to map unknown shapes to {reviewer, rating, text}
+  const get = (obj, keys) => {
+    for (const k of keys) {
+      if (obj && obj[k] != null) return obj[k];
+    }
+    return null;
+  };
+
+  // rating
+  let rating =
+    get(item, ["rating", "stars", "score"]) ??
+    get(item, ["starRating", "star_rating", "reviewRating"]);
+  if (typeof rating === "string") rating = parseFloat(rating);
+  if (typeof rating !== "number" || Number.isNaN(rating)) rating = null;
+
+  // reviewer/username
+  let reviewer =
+    get(item, ["reviewer", "username"]) ??
+    (isObject(item.user) ? get(item.user, ["username", "name", "handle"]) : null) ??
+    (isObject(item.buyer) ? get(item.buyer, ["username", "name", "handle"]) : null) ??
+    (isObject(item.reviewer) ? get(item.reviewer, ["username", "name", "handle"]) : null);
+
+  // text/message
+  let text =
+    get(item, ["text", "message", "comment", "review"]) ??
+    get(item, ["body", "content"]) ??
+    (isObject(item.feedback) ? get(item.feedback, ["text", "message", "comment"]) : null);
+
+  reviewer = clean(typeof reviewer === "string" ? reviewer : "");
+  text = clean(typeof text === "string" ? text : "");
+
+  return { reviewer, rating, text };
 }
 
 async function dismissPopups(page) {
-  // Whatnot মাঝে মাঝে app banner / overlay দেখায়
-  await clickIfExists(page, "button", /not now/i);
-  await clickIfExists(page, "button", /no thanks/i);
-  await clickIfExists(page, "button", /close/i);
-
-  // “Continue in app” / “Open App” থাকলে ignore (সবসময় close থাকে না)
-  // তাই এখানে শুধু best-effort
+  // best-effort close common overlays
+  const tries = [/not now/i, /no thanks/i, /close/i];
+  for (const r of tries) {
+    try {
+      const btn = page.getByRole("button", { name: r });
+      if ((await btn.count()) > 0) await btn.first().click({ timeout: 1200 });
+    } catch {}
+  }
 }
 
 async function scrollToLoad(page) {
-  // reviews lazy-load হতে পারে, তাই কয়েকবার scroll
   for (let i = 0; i < 6; i++) {
     await page.mouse.wheel(0, 900);
     await page.waitForTimeout(900);
@@ -51,133 +130,94 @@ async function main() {
     viewport: { width: 1280, height: 900 },
   });
 
+  // --- Capture network JSON (GraphQL) responses ---
+  const networkCandidates = [];
+  page.on("response", async (res) => {
+    try {
+      const url = res.url();
+      const ct = (res.headers()["content-type"] || "").toLowerCase();
+
+      // We only try JSON-ish responses (graphql or json)
+      if (!ct.includes("application/json") && !url.includes("graphql")) return;
+
+      const status = res.status();
+      if (status < 200 || status >= 300) return;
+
+      const data = await res.json().catch(() => null);
+      if (!data) return;
+
+      // store some candidates for later parsing
+      networkCandidates.push({ url, data });
+    } catch {}
+  });
+
   await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1500);
   await dismissPopups(page);
-
-  // reviews page হলেও safe
   await scrollToLoad(page);
+  await page.waitForTimeout(1500);
 
-  // --- Extract rendered reviews from DOM (best-effort) ---
-  const reviews = await page.evaluate((limit) => {
-    const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+  // 1) Try extract reviews from captured network JSON
+  let extracted = [];
+  for (const c of networkCandidates) {
+    const items = findReviewItemsDeep(c.data, []);
+    for (const it of items) {
+      const r = normalizeReview(it);
+      if (!r.reviewer || !r.text || r.rating == null) continue;
 
-    // Helper: is header/summary noise?
-    const isNoise = (t) =>
-      /following|followers|sold|whatnot|become a seller|log in|sign up/i.test(t);
+      // Filter obvious noise
+      if (/followers|following|sold|reviews\s*\(/i.test(r.text)) continue;
 
-    // Helper: contains rating like 5.0 / 4.9
-    const getRating = (t) => {
-      const m = t.match(/\b([0-5]\.\d)\b/);
-      return m ? parseFloat(m[1]) : null;
-    };
-
-    // Helper: contains date like 11/11/2025
-    const hasDate = (t) => /\b\d{1,2}\/\d{1,2}\/\d{4}\b/.test(t);
-
-    // Helper: probable username at start
-    const getReviewer = (t) => {
-      const m = t.match(/^\s*([a-z0-9_]{3,25})\b/i);
-      return m ? m[1] : null;
-    };
-
-    // 1) Try to locate review cards via “See more” anchors/buttons
-    const seeMoreEls = Array.from(document.querySelectorAll("a,button")).filter((el) =>
-      /see more/i.test(clean(el.textContent))
-    );
-
-    const candidateCards = [];
-
-    for (const el of seeMoreEls) {
-      let p = el.parentElement;
-      for (let i = 0; i < 10 && p; i++) {
-        const t = clean(p.textContent);
-        const rating = getRating(t);
-        if (rating !== null && !isNoise(t) && t.length > 40 && t.length < 900) {
-          candidateCards.push(p);
-          break;
-        }
-        p = p.parentElement;
-      }
+      extracted.push(r);
+      if (extracted.length > 50) break;
     }
+    if (extracted.length > 50) break;
+  }
 
-    // 2) Fallback: find compact blocks containing (rating + date) OR (rating + see more)
-    if (candidateCards.length === 0) {
+  // Deduplicate
+  const seen = new Set();
+  extracted = extracted.filter((r) => {
+    const key = `${r.reviewer}|${r.rating}|${r.text}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // 2) Fallback: if network method returns nothing, do a basic DOM attempt
+  if (extracted.length === 0) {
+    extracted = await page.evaluate((limit) => {
+      const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
       const blocks = Array.from(document.querySelectorAll("div"))
-        .map((el) => ({ el, t: clean(el.textContent) }))
-        .filter((x) => x.t.length > 40 && x.t.length < 650);
+        .map((el) => clean(el.textContent))
+        .filter((t) => t.length > 40 && t.length < 500);
 
-      for (const b of blocks) {
-        const t = b.t;
-        const rating = getRating(t);
-        if (rating === null) continue;
-        if (isNoise(t)) continue;
+      const out = [];
+      for (const t of blocks) {
+        if (/followers|following|sold/i.test(t)) continue;
+        const ratingMatch = t.match(/\b([0-5]\.\d)\b/);
+        const userMatch = t.match(/^\s*([a-z0-9_]{3,25})\b/i);
+        if (!ratingMatch || !userMatch) continue;
 
-        // likely review if contains date or "see more"
-        if (hasDate(t) || /see more/i.test(t)) {
-          candidateCards.push(b.el);
-        }
+        let body = t.replace(/see more/ig, "").trim();
+        body = body.replace(new RegExp("^" + userMatch[1] + "\\s*", "i"), "").trim();
+        if (body.length < 10) continue;
 
-        if (candidateCards.length > 60) break;
+        out.push({
+          reviewer: userMatch[1],
+          rating: parseFloat(ratingMatch[1]),
+          text: body,
+        });
+
+        if (out.length >= limit) break;
       }
-    }
-
-    // 3) Parse candidateCards -> {reviewer, rating, text}
-    const out = [];
-
-    for (const card of candidateCards) {
-      const raw = clean(card.textContent);
-
-      if (isNoise(raw)) continue;
-
-      const rating = getRating(raw);
-      if (rating === null) continue;
-
-      const reviewer = getReviewer(raw);
-      if (!reviewer) continue;
-
-      // Remove "See more"
-      let body = raw.replace(/see more/gi, "").trim();
-
-      // Remove reviewer from start
-      body = body.replace(new RegExp("^" + reviewer + "\\s*", "i"), "").trim();
-
-      // Remove date (if present) from start
-      body = body.replace(/^\b\d{1,2}\/\d{1,2}\/\d{4}\b\s*/i, "").trim();
-
-      // Remove rating token if it appears near start
-      body = body.replace(/^\b[0-5]\.\d\b\s*/i, "").trim();
-
-      // If body is still mostly meta, skip
-      if (body.length < 10) continue;
-
-      // Avoid capturing summary line like: "4.9 (28 Reviews) • 251 Sold ..."
-      if (/reviews\)\s*•\s*\d+\s*sold/i.test(body)) continue;
-
-      out.push({
-        reviewer,
-        rating,
-        text: body,
-      });
-
-      if (out.length >= limit * 3) break; // collect extra for dedupe
-    }
-
-    // 4) Dedupe by reviewer+text
-    const seen = new Set();
-    const uniq = [];
-    for (const r of out) {
-      const key = `${r.reviewer}|${r.rating}|${r.text}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      uniq.push(r);
-      if (uniq.length >= limit) break;
-    }
-
-    return uniq.slice(0, limit);
-  }, LIMIT);
+      return out.slice(0, limit);
+    }, LIMIT);
+  }
 
   await browser.close();
+
+  // Take top LIMIT
+  const reviews = extracted.slice(0, LIMIT);
 
   const payload = {
     source: "whatnot",

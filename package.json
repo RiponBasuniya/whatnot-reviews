@@ -1,0 +1,8 @@
+{
+  "name": "whatnot-reviews",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.45.0"
+  }
+}

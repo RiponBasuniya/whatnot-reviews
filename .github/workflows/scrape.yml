@@ -1,0 +1,35 @@
+name: Update Whatnot Reviews JSON
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npx playwright install --with-deps
+
+      - name: Run scraper
+        run: node fetch-whatnot-reviews.mjs
+
+      - name: Commit and push JSON
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add whatnot-reviews.json
+          git commit -m "Update whatnot reviews" || exit 0
+          git push
